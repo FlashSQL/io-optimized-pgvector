@@ -379,6 +379,70 @@ ResourceOwnerForgetFile(ResourceOwner owner, File file)
 	ResourceOwnerForget(owner, Int32GetDatum(file), &file_resowner_desc);
 }
 
+/* IO URING start */
+
+int ring_fd;
+void *sq_ring;
+struct io_uring_params params;
+unsigned *sq_tail;
+unsigned *sq_head;
+unsigned *cq_head;
+unsigned *cq_tail;
+void *sq_array;
+void *sqes;
+struct io_uring_cqe *cqes;
+
+static int setup_io_uring(struct io_uring_params *params, int *ring_fd) {
+    memset(params, 0, sizeof(*params));
+    *ring_fd = syscall(__NR_io_uring_setup, URING_MAX, params);
+    return *ring_fd;
+}
+
+static void *setup_ring_buffers(struct io_uring_params *params, int ring_fd) {
+    size_t size = params->sq_off.array + params->sq_entries * sizeof(unsigned);
+    void *ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd, IORING_OFF_SQ_RING);
+    return ptr;
+}
+
+static struct io_uring_sqe *get_sqe(unsigned sq_tail, unsigned sq_head, void *sq_array, void *sqes) {
+    if (sq_tail - sq_head == URING_MAX) {
+        return NULL;
+    }
+    unsigned idx = sq_tail & (URING_MAX - 1);
+    unsigned *sq_array_ptr = (unsigned *)sq_array;
+    struct io_uring_sqe *sqe = &((struct io_uring_sqe *)sqes)[idx];
+    sq_array_ptr[idx] = idx;
+    return sqe;
+}
+
+static int submit_io_uring() {
+    return syscall(__NR_io_uring_enter, ring_fd, *sq_tail, 0, IORING_ENTER_GETEVENTS);
+}
+
+void io_uring_prep_read(struct io_uring_sqe *sqe, int fd, void *buf, unsigned nbytes, __u64 offset) {
+    if (!sqe) {
+        fprintf(stderr, "No available SQEs\n");
+    }
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_READ;
+    sqe->fd = fd;
+    sqe->off = offset;
+    sqe->addr = (unsigned long) buf;
+    sqe->len = nbytes;
+    (*sq_tail)++;
+}
+
+void io_uring_sqe_set_data(struct io_uring_sqe *sqe, int user_data) {
+    sqe->user_data = user_data;
+}
+
+int io_uring_submit() {
+    return submit_io_uring();
+}
+
+
+/* IO URING end */
+
 /*
  * pg_fsync --- do fsync with or without writethrough
  */
@@ -915,6 +979,30 @@ InitFileAccess(void)
 	VfdCache->fd = VFD_CLOSED;
 
 	SizeVfdCache = 1;
+
+    ring_fd = setup_io_uring(&params, &ring_fd);
+    if (ring_fd < 0) {
+        perror("io_uring_setup");
+    }
+
+    sq_ring = setup_ring_buffers(&params, ring_fd);
+    if (sq_ring == MAP_FAILED) {
+        perror("mmap");
+    }
+
+    sq_tail = (unsigned *) ((char *) sq_ring + params.sq_off.tail);
+    sq_head = (unsigned *) ((char *) sq_ring + params.sq_off.head);
+    cq_head = (unsigned *) ((char *) sq_ring + params.cq_off.head);
+    cq_tail = (unsigned *) ((char *) sq_ring + params.cq_off.tail);
+    sq_array = (char *) sq_ring + params.sq_off.array;
+    sqes = mmap(0, params.sq_entries * sizeof(struct io_uring_sqe), PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_POPULATE, ring_fd, IORING_OFF_SQES);
+    cqes = mmap(0, params.cq_entries * sizeof(struct io_uring_cqe), PROT_READ | PROT_WRITE,
+                                     MAP_SHARED | MAP_POPULATE, ring_fd, IORING_OFF_CQ_RING);
+
+    if (sqes == MAP_FAILED) {
+        perror("mmap sqes");
+    }
 }
 
 /*
@@ -2188,6 +2276,102 @@ retry:
 	return returnCode;
 }
 
+int left = 0;
+
+void
+FileReadUringSubmit(File* files, const struct iovec *iov, off_t *offsets, int size, int *eElemIndexList)
+{
+	ssize_t		returnCode;
+    if (size == 0)
+    {
+        return;
+    }
+
+    if (left != 0)
+    {
+        elog(FATAL, "left is not 0. left: %d", left);
+    }
+
+	int ret;
+
+	for (int i = 0; i < size; i++) {
+		File file = files[i];
+
+		off_t offset = offsets[i];
+
+        struct io_uring_sqe *sqe = get_sqe(*sq_tail, *sq_head, sq_array, sqes);
+        memset(sqe, 0, sizeof(*sqe));
+		if (!sqe) {
+            elog(FATAL, "Could not get SQE.");
+		}
+
+		Assert(FileIsValid(file));
+
+		DO_DB(elog(LOG, "FileReadV: %d (%s) " INT64_FORMAT " %d",
+				   file, VfdCache[file].fileName,
+				   (int64) offset,
+				   iovcnt));
+
+		returnCode = FileAccess(file);
+		if (returnCode < 0)
+			elog(WARNING, "FileReadVUring file access error");
+
+		Vfd		   *vfdP = &VfdCache[file];
+
+        const struct iovec *targetIov = iov + i;
+        int eElemIndex = *(eElemIndexList + i);
+
+        io_uring_prep_read(sqe, vfdP->fd, targetIov->iov_base, targetIov->iov_len, offset);
+        io_uring_sqe_set_data(sqe, eElemIndex);
+	}
+
+	ret = io_uring_submit();
+
+	if (ret < 0) {
+        elog(FATAL, "io_uring_submit error. %d %s", ret, strerror(-ret));
+	}
+
+    left = size;
+}
+
+int
+FileReadUringPeek()
+{
+    if (left == 0)
+    {
+        elog(FATAL, "FileReadUringPeek: left is 0.");
+    }
+
+    while (true) {
+
+        while (*cq_head == *cq_tail) {
+            syscall(__NR_io_uring_enter, ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
+        }
+        struct io_uring_cqe *cqe = &((struct io_uring_cqe *) ((char *) sq_ring + params.cq_off.cqes))[*cq_head &
+                                                                                                      (params.cq_entries -
+                                                                                                       1)];
+        if (cqe->res < 0) {
+            printf("Error wait CQE: %d\n", cqe->res);
+            continue;
+        }
+
+        if (cqe->res != BLCKSZ) {
+            elog(FATAL, "Error read not BLCKSZ %d", cqe->res);
+        }
+
+        if (cqe != NULL) {
+            int eElemIndex = cqe -> user_data;
+            (*cq_head)++;
+            left--;
+            return eElemIndex;
+        }
+        else
+        {
+            elog(FATAL, "cqe is null");
+        }
+    }
+}
+
 ssize_t
 FileWriteV(File file, const struct iovec *iov, int iovcnt, off_t offset,
 		   uint32 wait_event_info)
@@ -3184,6 +3368,10 @@ BeforeShmemExit_Files(int code, Datum arg)
 #ifdef USE_ASSERT_CHECKING
 	temporary_files_allowed = false;
 #endif
+
+    munmap(sq_ring, params.sq_off.array + params.sq_entries * sizeof(unsigned));
+    munmap(sqes, params.sq_entries * sizeof(struct io_uring_sqe));
+    munmap(cqes, params.cq_entries * sizeof(struct io_uring_cqe));
 }
 
 /*

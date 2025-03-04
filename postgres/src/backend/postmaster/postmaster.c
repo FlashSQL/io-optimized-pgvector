@@ -3027,6 +3027,9 @@ process_pm_child_exit(void)
 			ereport(LOG,
 					(errmsg("database system is ready to accept connections")));
 
+			ereport(LOG,
+					(errmsg("This version uses pg_iou")));
+
 			/* Report status */
 			AddToDataDirLockFile(LOCK_FILE_LINE_PM_STATUS, PM_STATUS_READY);
 #ifdef USE_SYSTEMD

@@ -561,6 +561,115 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	UnlockReleaseBuffer(buf);
 }
 
+#define ELEM_COUNT 64
+
+Buffer		uringBufs[ELEM_COUNT];
+BlockNumber uringBlockNums[ELEM_COUNT];
+OffsetNumber uringOffsetNums[ELEM_COUNT];
+
+HnswElement elements[ELEM_COUNT];
+double eDistances[ELEM_COUNT];
+
+
+void
+HnswLoadElementUringSubmit(BlockNumber *uringBlockNums, int eElementCnt, Relation index)
+{
+    ReadBufferUringSubmit(uringBufs, index, uringBlockNums, eElementCnt);
+}
+
+int
+HnswLoadElementUringPeek(double *eDistances, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
+{
+	Buffer		buf;
+	Page		page;
+	HnswElementTuple etup;
+	BlockNumber blkno;
+	OffsetNumber offno;
+	HnswElement* element;
+
+	/* Read vector */
+	int eElemIndex = ReadBufferUringPeek();
+    buf = uringBufs[eElemIndex];
+    double *distance = &(eDistances[eElemIndex]);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+	blkno = uringBlockNums[eElemIndex];
+	offno = uringOffsetNums[eElemIndex];
+    etup = (HnswElementTuple)PageGetItem(page, PageGetItemId(page, offno));
+	element = &elements[eElemIndex];
+
+    Assert(HnswIsElementTuple(etup));
+
+    /* Calculate distance */
+    if (distance != NULL)
+    {
+	    if (DatumGetPointer(q->value) == NULL)
+		    *distance = 0;
+	    else
+		    *distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+    }
+	/* Load element */
+	if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
+	{
+		if (*element == NULL)
+			*element = HnswInitElementFromBlock(blkno, offno);
+
+		HnswLoadElementFromTuple(*element, etup, true, loadVec);
+	}
+
+    UnlockReleaseBuffer(buf);
+	return eElemIndex;
+}
+
+int
+HnswLoadElementUringPeekAll(double *eDistances, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, int unvisitedLength)
+{
+	Buffer		buf;
+	Page		page;
+	HnswElementTuple etup;
+	BlockNumber blkno;
+	OffsetNumber offno;
+	HnswElement* element;
+
+	for (int i = 0; i < unvisitedLength; i++)
+	{
+		ReadBufferUringPeek();
+	}
+
+	for (int eElemIndex = 0; eElemIndex < unvisitedLength; eElemIndex++)
+	{
+		buf = uringBufs[eElemIndex];
+		double *distance = &(eDistances[eElemIndex]);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		blkno = uringBlockNums[eElemIndex];
+		offno = uringOffsetNums[eElemIndex];
+		etup = (HnswElementTuple)PageGetItem(page, PageGetItemId(page, offno));
+		element = &elements[eElemIndex];
+
+		Assert(HnswIsElementTuple(etup));
+
+		/* Calculate distance */
+		if (distance != NULL)
+		{
+			if (DatumGetPointer(q->value) == NULL)
+				*distance = 0;
+			else
+				*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+		}
+		/* Load element */
+		if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
+		{
+			if (*element == NULL)
+				*element = HnswInitElementFromBlock(blkno, offno);
+
+			HnswLoadElementFromTuple(*element, etup, true, loadVec);
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+}
+
 /*
  * Load an element and optionally get its distance from q
  */
@@ -807,6 +916,160 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 	}
 }
 
+void HnswEvalNeighborsParallel(char* base, HnswQuery* q, int ef, int lc, Relation index, HnswSupport* support,
+                               bool inserting, HnswElement skipElement, pairingheap** discarded, pairingheap* C, pairingheap* W,
+                               int* wlen, HnswUnvisited* unvisited, int unvisitedLength, bool inMemory, HnswSearchCandidate** f)
+{
+	for (int i = 0; i < unvisitedLength; i++)
+	{
+		ItemPointer indextid = &unvisited[i].indextid;
+		uringBlockNums[i] = ItemPointerGetBlockNumber(indextid);
+		uringOffsetNums[i] = ItemPointerGetOffsetNumber(indextid);
+
+		uringBufs[i] = 0;
+		elements[i] = NULL;
+		eDistances[i] = 0;
+	}
+
+	bool alwaysAdd = *wlen < ef;
+	HnswLoadElementUringSubmit(uringBlockNums, unvisitedLength, index);
+	HnswLoadElementUringPeekAll(eDistances, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &(*f)->distance, unvisitedLength);
+
+	for (int eElemIndex = 0; eElemIndex < unvisitedLength; eElemIndex++)
+	{
+		HnswElement eElement;
+		HnswSearchCandidate* e;
+		double eDistance;
+
+		*f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+
+
+		ItemPointer indextid = &unvisited[eElemIndex].indextid;
+
+		/* Avoid any allocations if not adding */
+		eDistance = eDistances[eElemIndex];
+		eElement = elements[eElemIndex];
+
+		if (eElement == NULL)
+			continue;
+
+		if (eElement == NULL || !(eDistance < (*f)->distance || alwaysAdd))
+		{
+			if (discarded != NULL)
+			{
+				/* Create a new candidate */
+				e = HnswInitSearchCandidate(base, eElement, eDistance);
+				pairingheap_add(*discarded, &e->w_node);
+			}
+
+			continue;
+		}
+
+		/* Make robust to issues */
+		if (eElement->level < lc)
+			continue;
+
+		/* Create a new candidate */
+		e = HnswInitSearchCandidate(base, eElement, eDistance);
+		pairingheap_add(C, &e->c_node);
+		pairingheap_add(W, &e->w_node);
+
+		/*
+			 * Do not count elements being deleted towards ef when vacuuming.
+			 * It would be ideal to do this for inserts as well, but this
+			 * could affect insert performance.
+			 */
+		if (CountElement(skipElement, eElement))
+		{
+			(*wlen)++;
+
+			/* No need to decrement wlen */
+			if (*wlen > ef)
+			{
+				HnswSearchCandidate* d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+				if (discarded != NULL)
+					pairingheap_add(*discarded, &d->w_node);
+			}
+		}
+	}
+}
+
+void HnswEvalNeighbors(char* base, HnswQuery* q, int ef, int lc, Relation index, HnswSupport* support, bool inserting,
+                       HnswElement skipElement, pairingheap** discarded, pairingheap* C, pairingheap* W, int* wlen,
+                       HnswUnvisited* unvisited, int unvisitedLength, bool inMemory, HnswSearchCandidate** f)
+{
+	for (int i = 0; i < unvisitedLength; i++)
+	{
+		HnswElement eElement;
+		HnswSearchCandidate* e;
+		double eDistance;
+		bool alwaysAdd = *wlen < ef;
+
+		*f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+
+		if (inMemory)
+		{
+			eElement = unvisited[i].element;
+			eDistance = GetElementDistance(base, eElement, q, support);
+		}
+		else
+		{
+			ItemPointer indextid = &unvisited[i].indextid;
+			BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+			OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+
+			/* Avoid any allocations if not adding */
+			eElement = NULL;
+			HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting,
+			                    alwaysAdd || discarded != NULL ? NULL : &(*f)->distance, &eElement);
+
+			if (eElement == NULL)
+				continue;
+		}
+
+		if (eElement == NULL || !(eDistance < (*f)->distance || alwaysAdd))
+		{
+			if (discarded != NULL)
+			{
+				/* Create a new candidate */
+				e = HnswInitSearchCandidate(base, eElement, eDistance);
+				pairingheap_add(*discarded, &e->w_node);
+			}
+
+			continue;
+		}
+
+		/* Make robust to issues */
+		if (eElement->level < lc)
+			continue;
+
+		/* Create a new candidate */
+		e = HnswInitSearchCandidate(base, eElement, eDistance);
+		pairingheap_add(C, &e->c_node);
+		pairingheap_add(W, &e->w_node);
+
+		/*
+			 * Do not count elements being deleted towards ef when vacuuming.
+			 * It would be ideal to do this for inserts as well, but this
+			 * could affect insert performance.
+			 */
+		if (CountElement(skipElement, eElement))
+		{
+			(*wlen)++;
+
+			/* No need to decrement wlen */
+			if (*wlen > ef)
+			{
+				HnswSearchCandidate* d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+				if (discarded != NULL)
+					pairingheap_add(*discarded, &d->w_node);
+			}
+		}
+	}
+}
+
 /*
  * Algorithm 2 from paper
  */
@@ -895,74 +1158,12 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (tuples != NULL)
 			(*tuples) += unvisitedLength;
 
-		for (int i = 0; i < unvisitedLength; i++)
-		{
-			HnswElement eElement;
-			HnswSearchCandidate *e;
-			double		eDistance;
-			bool		alwaysAdd = wlen < ef;
-
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
-
-			if (inMemory)
-			{
-				eElement = unvisited[i].element;
-				eDistance = GetElementDistance(base, eElement, q, support);
-			}
-			else
-			{
-				ItemPointer indextid = &unvisited[i].indextid;
-				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
-				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
-
-				/* Avoid any allocations if not adding */
-				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
-
-				if (eElement == NULL)
-					continue;
-			}
-
-			if (eElement == NULL || !(eDistance < f->distance || alwaysAdd))
-			{
-				if (discarded != NULL)
-				{
-					/* Create a new candidate */
-					e = HnswInitSearchCandidate(base, eElement, eDistance);
-					pairingheap_add(*discarded, &e->w_node);
-				}
-
-				continue;
-			}
-
-			/* Make robust to issues */
-			if (eElement->level < lc)
-				continue;
-
-			/* Create a new candidate */
-			e = HnswInitSearchCandidate(base, eElement, eDistance);
-			pairingheap_add(C, &e->c_node);
-			pairingheap_add(W, &e->w_node);
-
-			/*
-			 * Do not count elements being deleted towards ef when vacuuming.
-			 * It would be ideal to do this for inserts as well, but this
-			 * could affect insert performance.
-			 */
-			if (CountElement(skipElement, eElement))
-			{
-				wlen++;
-
-				/* No need to decrement wlen */
-				if (wlen > ef)
-				{
-					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
-
-					if (discarded != NULL)
-						pairingheap_add(*discarded, &d->w_node);
-				}
-			}
-		}
+		if (inMemory)
+			HnswEvalNeighbors(base, q, ef, lc, index, support, inserting, skipElement, discarded, C, W, &wlen, unvisited, unvisitedLength,
+					inMemory, &f);
+		else
+			HnswEvalNeighborsParallel(base, q, ef, lc, index, support, inserting, skipElement, discarded, C, W, &wlen, unvisited, unvisitedLength,
+					inMemory, &f);
 	}
 
 	/* Add each element of W to w */
@@ -972,7 +1173,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		w = lappend(w, sc);
 	}
-
 	return w;
 }
 

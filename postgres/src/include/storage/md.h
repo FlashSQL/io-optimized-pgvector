@@ -34,6 +34,8 @@ extern bool mdprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, int nblocks);
 extern void mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					void **buffers, BlockNumber nblocks);
+extern void md_uring_submit(SMgrRelation reln, BlockNumber *blocknums, void **buffers, int nblocks, int *ioBlockElemIndexList);
+extern int md_uring_peek();
 extern void mdwritev(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum,
 					 const void **buffers, BlockNumber nblocks, bool skipFsync);

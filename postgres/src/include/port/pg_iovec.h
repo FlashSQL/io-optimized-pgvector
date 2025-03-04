@@ -35,6 +35,7 @@ struct iovec
 
 /* Define a reasonable maximum that is safe to use on the stack. */
 #define PG_IOV_MAX Min(IOV_MAX, 32)
+#define URING_MAX 64
 
 /*
  * Like preadv(), but with a prefix to remind us of a side-effect: on Windows

@@ -66,6 +66,7 @@ HnswInitLockTranche(void)
 void
 HnswInit(void)
 {
+	elog(LOG, "This version uses pg_iou");
 	if (!process_shared_preload_libraries_in_progress)
 		HnswInitLockTranche();
 

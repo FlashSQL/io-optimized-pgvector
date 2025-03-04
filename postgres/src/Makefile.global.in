@@ -765,6 +765,9 @@ ifeq ($(PORTNAME),win32)
 LIBS += -lws2_32
 endif
 
+# add liburing
+LIBS := -luring $(LIBS)
+
 # Not really standard libc functions, used by the backend.
 TAS         = @TAS@
 

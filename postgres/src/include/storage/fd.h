@@ -47,6 +47,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/io_uring.h>
+#include <sys/syscall.h>
 
 typedef int File;
 
@@ -108,6 +110,8 @@ extern File OpenTemporaryFile(bool interXact);
 extern void FileClose(File file);
 extern int	FilePrefetch(File file, off_t offset, off_t amount, uint32 wait_event_info);
 extern ssize_t FileReadV(File file, const struct iovec *ioc, int iovcnt, off_t offset, uint32 wait_event_info);
+extern void FileReadUringSubmit(File* files, const struct iovec *iov, off_t *offsets, int size, int *eElemIndexList);
+extern int FileReadUringPeek();
 extern ssize_t FileWriteV(File file, const struct iovec *ioc, int iovcnt, off_t offset, uint32 wait_event_info);
 extern int	FileSync(File file, uint32 wait_event_info);
 extern int	FileZero(File file, off_t offset, off_t amount, uint32 wait_event_info);

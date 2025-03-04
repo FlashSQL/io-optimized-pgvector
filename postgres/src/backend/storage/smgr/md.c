@@ -920,6 +920,54 @@ mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	}
 }
 
+struct iovec iov[URING_MAX];
+off_t		offsets[URING_MAX];
+File files[URING_MAX];
+
+void
+md_uring_submit(SMgrRelation reln, BlockNumber *blocknums, void **buffers, int nblocks, int *ioBlockElemIndexList)
+{
+	ForkNumber forknum = MAIN_FORKNUM;
+
+	int blocks_done = 0;
+	while (blocks_done < nblocks)
+	{
+		int size_this_segment = Min(URING_MAX, nblocks - blocks_done);
+        int *elemIndexList = ioBlockElemIndexList + blocks_done;
+
+		for (int i = 0; i < size_this_segment; i++)
+		{
+			off_t		seekpos;
+			int			blkIndex = i + blocks_done;
+
+			BlockNumber blocknum = blocknums[blkIndex];
+
+			MdfdVec    *v = _mdfd_getseg(reln, forknum, blocknum, false, EXTENSION_FAIL | EXTENSION_CREATE_RECOVERY);
+			files[i] = v->mdfd_vfd;
+
+			seekpos = (off_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
+			Assert(seekpos < (off_t) BLCKSZ * RELSEG_SIZE);
+
+			offsets[i] = seekpos;
+
+			iov[i].iov_base = buffers[blkIndex];
+			iov[i].iov_len = BLCKSZ;
+		}
+
+		FileReadUringSubmit(files, iov, offsets, size_this_segment, elemIndexList);
+
+		blocks_done += size_this_segment;
+	}
+
+	Assert(blocks_done == nblocks);
+}
+
+int
+md_uring_peek()
+{
+    return FileReadUringPeek();
+}
+
 /*
  * mdwritev() -- Write the supplied blocks at the appropriate location.
  *

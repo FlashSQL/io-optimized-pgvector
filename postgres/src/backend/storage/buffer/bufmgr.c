@@ -47,6 +47,7 @@
 #include "postmaster/bgwriter.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/md.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -1211,6 +1212,252 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 									  found);
 
 	return BufferDescriptorGetBuffer(bufHdr);
+}
+
+#define BLOCK_COUNT 200
+
+BufferDesc *ioBufHdrs[BLOCK_COUNT];
+BlockNumber ioBlockNumbers[BLOCK_COUNT];
+Buffer *ioBufs[BLOCK_COUNT];
+Block ioBlocks[BLOCK_COUNT];
+int ioBlockToeElemIndexMap[BLOCK_COUNT];
+int ioBlockIndexMap[BLOCK_COUNT];
+
+int ready[BLOCK_COUNT];
+int readySize;
+int readyHead;
+int readyTail;
+
+int cachedButNotIOYetIndex[BLOCK_COUNT];
+BlockNumber cachedButNotIOYetIoBlock[BLOCK_COUNT];
+int cachedButNotIOYetCount;
+
+static void
+ReadBuffer_uring_submit(Buffer *bufs, BlockNumber *blockNumbers, int blockCount,
+                 SMgrRelation smgr, char relpersistence, bool *hit) {
+    bool found;
+    IOContext io_context;
+    IOObject io_object;
+    ForkNumber forkNum = MAIN_FORKNUM;
+    ReadBufferMode mode = RBM_NORMAL;
+    BufferAccessStrategy strategy = NULL;
+
+    if (!(readyHead == readySize && readyHead == readyTail))
+    {
+        elog(FATAL, "readySize, readyHead, readyTail must be same. readySize:%d, readyHead:%d, readyTail:%d", readySize, readyHead, readyTail);
+    }
+
+    if (readyHead != readySize)
+    {
+        elog(FATAL, "readyHead is not equal to readySize. readyHead:%d, readysize:%d", readyHead, readySize);
+    }
+
+	int ioBlockCount = 0;
+    readyHead = 0;
+    readyTail = 0;
+    readySize = blockCount;
+
+    cachedButNotIOYetCount = 0;
+
+	*hit = false;
+
+	TRACE_POSTGRESQL_BUFFER_READ_START(forkNum, blockNum,
+									   smgr->smgr_rlocator.locator.spcOid,
+									   smgr->smgr_rlocator.locator.dbOid,
+									   smgr->smgr_rlocator.locator.relNumber,
+									   smgr->smgr_rlocator.backend);
+
+	/*
+	 * lookup the buffer.  IO_IN_PROGRESS is set if the requested block is
+	 * not currently in memory.
+	 */
+	io_context = IOContextForStrategy(strategy);
+	io_object = IOOBJECT_RELATION;
+
+	int i = 0;
+	for (i = 0; i < blockCount; i++)
+	{
+		BlockNumber blockNum = blockNumbers[i];
+
+		BufferDesc *bufHdr = BufferAlloc(smgr, relpersistence, forkNum, blockNum,
+							 strategy, &found, io_context);
+
+        Buffer buf = BufferDescriptorGetBuffer(bufHdr);
+
+		if (found)
+			pgBufferUsage.shared_blks_hit++;
+		else if (mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG ||
+				 mode == RBM_ZERO_ON_ERROR)
+			pgBufferUsage.shared_blks_read++;
+
+		/* At this point we do NOT hold any locks. */
+
+		/* if it was already in the buffer pool, we're done */
+		if (found)
+		{
+			/* Just need to update stats before we exit */
+			*hit = true;
+			VacuumPageHit++;
+			pgstat_count_io_op(io_object, io_context, IOOP_HIT);
+
+			if (VacuumCostActive)
+				VacuumCostBalance += VacuumCostPageHit;
+
+			TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, blockNum,
+											  smgr->smgr_rlocator.locator.spcOid,
+											  smgr->smgr_rlocator.locator.dbOid,
+											  smgr->smgr_rlocator.locator.relNumber,
+											  smgr->smgr_rlocator.backend,
+											  found);
+
+			bufs[i] = buf;
+
+            int j = 0;
+            for (j = 0; j < ioBlockCount; j++)
+            {
+                if (ioBlockNumbers[j] == blockNum)
+                {
+                    cachedButNotIOYetIndex[cachedButNotIOYetCount] = i;
+                    cachedButNotIOYetIoBlock[cachedButNotIOYetCount] = j;
+                    cachedButNotIOYetCount++;
+                    break;
+                }
+            }
+
+            if (j == ioBlockCount)
+            {
+                ready[readyHead] = i;
+                readyHead++;
+            }
+		}
+		else
+		{
+			ioBufHdrs[ioBlockCount] = bufHdr;
+			ioBlockNumbers[ioBlockCount] = blockNum;
+            ioBlockToeElemIndexMap[ioBlockCount] = i;
+            ioBufs[ioBlockCount] = &bufs[i];
+            ioBlockIndexMap[i] = ioBlockCount;
+            ioBlockCount++;
+        }
+	}
+
+	/*
+	 * if we have gotten to this point, we have allocated a buffer for the
+	 * page but its contents are not yet valid.  IO_IN_PROGRESS is set for it,
+	 * if it's a shared buffer.
+	 */
+
+	for (i = 0; i < ioBlockCount; i++)
+	{
+		BufferDesc *bufHdr = ioBufHdrs[i];
+		Assert(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID));	/* spinlock not needed */
+		Block bufBlock = BufHdrGetBlock(bufHdr);
+		ioBlocks[i] = bufBlock;
+	}
+
+	/*
+	 * Read in the page, unless the caller intends to overwrite it and just
+	 * wants us to allocate a buffer.
+	 */
+
+	instr_time	io_start = pgstat_prepare_io_time(track_io_timing);
+
+    if (ioBlockCount > 0)
+    {
+        md_uring_submit(smgr, ioBlockNumbers, ioBlocks, ioBlockCount, ioBlockToeElemIndexMap);
+    }
+
+	pgstat_count_io_op_time(io_object, io_context,
+							IOOP_READ, io_start, 1);
+
+	TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, blockNum,
+									  smgr->smgr_rlocator.locator.spcOid,
+									  smgr->smgr_rlocator.locator.dbOid,
+									  smgr->smgr_rlocator.locator.relNumber,
+									  smgr->smgr_rlocator.backend,
+									  found);
+}
+
+int
+ReadBuffer_uring_peek()
+{
+    int ret;
+    if (readyTail < readyHead)
+    {
+        ret = ready[readyTail];
+        readyTail++;
+        return ret;
+    }
+
+
+    ret = md_uring_peek();
+    int ioBlockIndex = ioBlockIndexMap[ret];
+    {
+        /* Set BM_VALID, terminate IO, and wake up any waiters */
+        TerminateBufferIO(ioBufHdrs[ioBlockIndex], false, BM_VALID, true);
+
+        VacuumPageMiss++;
+        if (VacuumCostActive)
+            VacuumCostBalance += VacuumCostPageMiss;
+
+        Buffer buf = BufferDescriptorGetBuffer(ioBufHdrs[ioBlockIndex]);
+        *ioBufs[ioBlockIndex] = buf;
+    }
+    readyHead++;
+    readyTail++;
+
+    for (int i = 0; i < cachedButNotIOYetCount; i++)
+    {
+        if (cachedButNotIOYetIoBlock[i] == ioBlockIndex)
+        {
+            ready[readyHead] = cachedButNotIOYetIndex[i];
+            readyHead++;
+        }
+    }
+
+    if (readyTail > readyHead)
+    {
+        elog(FATAL, "readyTail is bigger than readyHead. readyTail:%d, readyHead:%d", readyTail, readyHead);
+    }
+    return ret;
+}
+
+void
+ReadBufferExtendedUringSubmit(Buffer *bufs, Relation reln, BlockNumber *blockNumbers, int blockCnt)
+{
+	bool		hit;
+	Buffer		buf;
+
+	/*
+	 * Reject attempts to read non-local temporary relations; we would be
+	 * likely to get wrong data since we have no visibility into the owning
+	 * session's local buffers.
+	 */
+	if (RELATION_IS_OTHER_TEMP(reln))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access temporary tables of other sessions")));
+
+	/*
+	 * Read the buffer, and update pgstat counters to reflect a cache hit or
+	 * miss.
+	 */
+	pgstat_count_buffer_read(reln);
+    ReadBuffer_uring_submit(bufs, blockNumbers, blockCnt, RelationGetSmgr(reln), reln->rd_rel->relpersistence, &hit);
+	if (hit)
+		pgstat_count_buffer_hit(reln);
+}
+
+void
+ReadBufferUringSubmit(Buffer *bufs, Relation reln, BlockNumber *blockNumbers, int blockCnt)
+{
+	ReadBufferExtendedUringSubmit(bufs, reln, blockNumbers, blockCnt);
+}
+
+int
+ReadBufferUringPeek()
+{
+    return ReadBuffer_uring_peek();
 }
 
 /*
