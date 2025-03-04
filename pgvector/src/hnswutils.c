@@ -621,55 +621,6 @@ HnswLoadElementUringPeek(double *eDistances, HnswQuery * q, Relation index, Hnsw
 	return eElemIndex;
 }
 
-int
-HnswLoadElementUringPeekAll(double *eDistances, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, int unvisitedLength)
-{
-	Buffer		buf;
-	Page		page;
-	HnswElementTuple etup;
-	BlockNumber blkno;
-	OffsetNumber offno;
-	HnswElement* element;
-
-	for (int i = 0; i < unvisitedLength; i++)
-	{
-		ReadBufferUringPeek();
-	}
-
-	for (int eElemIndex = 0; eElemIndex < unvisitedLength; eElemIndex++)
-	{
-		buf = uringBufs[eElemIndex];
-		double *distance = &(eDistances[eElemIndex]);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		blkno = uringBlockNums[eElemIndex];
-		offno = uringOffsetNums[eElemIndex];
-		etup = (HnswElementTuple)PageGetItem(page, PageGetItemId(page, offno));
-		element = &elements[eElemIndex];
-
-		Assert(HnswIsElementTuple(etup));
-
-		/* Calculate distance */
-		if (distance != NULL)
-		{
-			if (DatumGetPointer(q->value) == NULL)
-				*distance = 0;
-			else
-				*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
-		}
-		/* Load element */
-		if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
-		{
-			if (*element == NULL)
-				*element = HnswInitElementFromBlock(blkno, offno);
-
-			HnswLoadElementFromTuple(*element, etup, true, loadVec);
-		}
-
-		UnlockReleaseBuffer(buf);
-	}
-}
-
 /*
  * Load an element and optionally get its distance from q
  */
@@ -931,22 +882,22 @@ void HnswEvalNeighborsParallel(char* base, HnswQuery* q, int ef, int lc, Relatio
 		eDistances[i] = 0;
 	}
 
-	bool alwaysAdd = *wlen < ef;
 	HnswLoadElementUringSubmit(uringBlockNums, unvisitedLength, index);
-	HnswLoadElementUringPeekAll(eDistances, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &(*f)->distance, unvisitedLength);
 
-	for (int eElemIndex = 0; eElemIndex < unvisitedLength; eElemIndex++)
+	for (int i = 0; i < unvisitedLength; i++)
 	{
 		HnswElement eElement;
 		HnswSearchCandidate* e;
 		double eDistance;
+		bool alwaysAdd = *wlen < ef;
 
 		*f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
 
-		ItemPointer indextid = &unvisited[eElemIndex].indextid;
+		ItemPointer indextid = &unvisited[i].indextid;
 
 		/* Avoid any allocations if not adding */
+		int eElemIndex = HnswLoadElementUringPeek(eDistances, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &(*f)->distance);
 		eDistance = eDistances[eElemIndex];
 		eElement = elements[eElemIndex];
 

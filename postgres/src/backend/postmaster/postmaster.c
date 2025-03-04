@@ -3028,7 +3028,7 @@ process_pm_child_exit(void)
 					(errmsg("database system is ready to accept connections")));
 
 			ereport(LOG,
-					(errmsg("This version uses pg_iou")));
+					(errmsg("This version uses pg_async_iou")));
 
 			/* Report status */
 			AddToDataDirLockFile(LOCK_FILE_LINE_PM_STATUS, PM_STATUS_READY);
